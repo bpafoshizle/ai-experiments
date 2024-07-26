@@ -1,0 +1,9 @@
+langchain-ollama==0.1.0
+rich==13.7.1
+langchain==0.2.11
+python-dotenv==1.0.1
+langchain-community==0.2.10
+langgraph==0.1.14
+beautifulsoup4==4.12.3
+tiktoken==0.7.0
+scikit-learn==1.5.1
