@@ -17,10 +17,12 @@ from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_ollama import ChatOllama
 from langchain.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-# from langchain_core.prompts import ChatPromptTemplate
-# from langchain_core.pydantic_v1 import BaseModel, Field
 from langchain_core.output_parsers import JsonOutputParser
 from langgraph.graph import START, END, StateGraph
+from langsmith import Client
+from langchain import hub
+from langsmith.schemas import Example, Run
+from langsmith.evaluation import evaluate
 
 # Load the environment file (.env) into the current process
 load_dotenv()
@@ -265,15 +267,120 @@ def predict_custom_agent_answer(example: dict):
     return {"response": state_dict["generation"], "steps": state_dict["steps"]}
 
 
-example = {"input": "What are the types of agent memory?"}
-response = predict_custom_agent_answer(example)
-print("##############RAW#############")
-print(response)
-print("##############PPRINT#############")
-print(pprint.pformat(response))
-print("##############JSON#############")
-print(json.dumps(response, indent=4))
-print("##############TABULATE#############")
-print(response)
-print("##############RICH#############")
-print(response["response"])
+# example = {"input": "What are the types of agent memory?"}
+# response = predict_custom_agent_answer(example)
+# print("##############RAW#############")
+# print(response)
+# print("##############PPRINT#############")
+# print(pprint.pformat(response))
+# print("##############JSON#############")
+# print(json.dumps(response, indent=4))
+# print("##############TABULATE#############")
+# print(response)
+# print("##############RICH#############")
+# print(response["response"])
+
+client = Client()
+
+# Create a dataset
+examples = [
+    (
+        "How does the ReAct agent use self-reflection? ",
+        "ReAct integrates reasoning and acting, performing actions - such tools like Wikipedia search API - and then observing / reasoning about the tool outputs.",
+    ),
+    (
+        "What are the types of biases that can arise with few-shot prompting?",
+        "The biases that can arise with few-shot prompting include (1) Majority label bias, (2) Recency bias, and (3) Common token bias.",
+    ),
+    (
+        "What are five types of adversarial attacks?",
+        "Five types of adversarial attacks are (1) Token manipulation, (2) Gradient based attack, (3) Jailbreak prompting, (4) Human red-teaming, (5) Model red-teaming.",
+    ),
+    (
+        "Who did the Chicago Bears draft first in the 2024 NFL draft”?",
+        "The Chicago Bears drafted Caleb Williams first in the 2024 NFL draft.",
+    ),
+    ("Who won the 2024 NBA finals?", "The Boston Celtics on the 2024 NBA finals"),
+]
+
+# Save it
+dataset_name = "Corrective RAG Agent Testing"
+if not client.has_dataset(dataset_name=dataset_name):
+    dataset = client.create_dataset(dataset_name=dataset_name)
+    inputs, outputs = zip(
+        *[({"input": text}, {"output": label}) for text, label in examples]
+    )
+    client.create_examples(inputs=inputs, outputs=outputs, dataset_id=dataset.id)
+
+# Grade prompt
+grade_prompt_answer_accuracy = hub.pull("langchain-ai/rag-answer-vs-reference")
+
+
+def answer_evaluator(run, example) -> dict:
+    """
+    A simple evaluator for RAG answer accuracy
+    """
+
+    # Get the question, the ground truth reference answer, RAG chain answer prediction
+    input_question = example.inputs["input"]
+    reference = example.outputs["output"]
+    prediction = run.outputs["response"]
+
+    # Define an LLM grader
+    llm = ChatOllama(
+        model="llama3.1",
+        temperature=0,
+    )
+    answer_grader = grade_prompt_answer_accuracy | llm
+
+    # Run evaluator
+    score = answer_grader.invoke(
+        {
+            "question": input_question,
+            "correct_answer": reference,
+            "student_answer": prediction,
+        }
+    )
+    score = score["Score"]
+    return {"key": "answer_v_reference_score", "score": score}
+
+# Reasoning traces that we expect the agents to take
+expected_trajectory_1 = [
+    "retrieve_documents",
+    "grade_document_retrieval",
+    "web_search",
+    "generate_answer",
+]
+expected_trajectory_2 = [
+    "retrieve_documents",
+    "grade_document_retrieval",
+    "generate_answer",
+]
+
+def check_trajectory_custom(root_run: Run, example: Example) -> dict:
+    """
+    Check if all expected tools are called in exact order and without any additional tool calls.
+    """
+    tool_calls = root_run.outputs["steps"]
+    print(f"Tool calls custom agent: {tool_calls}")
+    if tool_calls == expected_trajectory_1 or tool_calls == expected_trajectory_2:
+        score = 1
+    else:
+        score = 0
+
+    return {"score": int(score), "key": "tool_calls_in_exact_order"}
+
+
+dataset_name = "Corrective RAG Agent Testing"
+model_tested = "llama3.1"
+metadata = "CRAG, llama3.1"
+experiment_prefix = f"custom-agent-{model_tested}"
+experiment_results = evaluate(
+    predict_custom_agent_answer,
+    data=dataset_name,
+    evaluators=[answer_evaluator, check_trajectory_custom],
+    experiment_prefix=experiment_prefix + "-answer-and-tool-use",
+    num_repetitions=3,
+    max_concurrency=1,
+    metadata={"version": metadata},
+)
